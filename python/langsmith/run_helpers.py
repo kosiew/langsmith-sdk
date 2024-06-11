@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent
 import contextlib
 import contextvars
 import datetime
 import functools
 import inspect
 import logging
+import threading
 import uuid
 import warnings
 from contextvars import copy_context
@@ -35,12 +37,11 @@ from typing import (
     runtime_checkable,
 )
 
-from typing_extensions import ParamSpec, TypeGuard
-
 from langsmith import client as ls_client
 from langsmith import run_trees, utils
 from langsmith._internal import _aiter as aitertools
 from langsmith.env import _runtime_env
+from typing_extensions import ParamSpec, TypeGuard
 
 if TYPE_CHECKING:
     from langchain_core.runnables import Runnable
@@ -464,7 +465,9 @@ def traceable(
 
         @functools.wraps(func)
         async def async_generator_wrapper(
-            *args: Any, langsmith_extra: Optional[LangSmithExtra] = None, **kwargs: Any
+            *args: Any,
+            langsmith_extra: Optional[LangSmithExtra] = None,
+            **kwargs: Any,
         ) -> AsyncGenerator:
             run_container = _setup_run(
                 func,
@@ -571,7 +574,9 @@ def traceable(
 
         @functools.wraps(func)
         def generator_wrapper(
-            *args: Any, langsmith_extra: Optional[LangSmithExtra] = None, **kwargs: Any
+            *args: Any,
+            langsmith_extra: Optional[LangSmithExtra] = None,
+            **kwargs: Any,
         ) -> Any:
             run_container = _setup_run(
                 func,
@@ -631,6 +636,13 @@ def traceable(
                 function_result = None
             _container_end(run_container, outputs=function_result)
 
+        def wrap_with_context(context, func, *args, **kwargs):
+            """
+            Helper function to run a function with a specific context.
+            """
+            with tracing_context(**get_tracing_context(context)):
+                return func(*args, **kwargs)
+
         if inspect.isasyncgenfunction(func):
             selected_wrapper: Callable = async_generator_wrapper
         elif is_async(func):
@@ -642,8 +654,37 @@ def traceable(
             selected_wrapper = generator_wrapper
         else:
             selected_wrapper = wrapper
-        setattr(selected_wrapper, "__langsmith_traceable__", True)
-        sig = inspect.signature(selected_wrapper)
+
+        @functools.wraps(selected_wrapper)
+        def thread_pool_wrapper(*args, **kwargs):
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                context = threading.local()
+                context.run_container = _setup_run(
+                    func,
+                    container_input=container_input,
+                    langsmith_extra=None,
+                    args=args,
+                    kwargs=kwargs,
+                )
+                func_accepts_parent_run = (
+                    inspect.signature(func).parameters.get("run_tree", None) is not None
+                )
+                if func_accepts_parent_run:
+                    kwargs["run_tree"] = context.run_container["new_run"]
+                if not func_accepts_config:
+                    kwargs.pop("config", None)
+
+                future = executor.submit(
+                    wrap_with_context,
+                    context.run_container["context"],
+                    selected_wrapper,
+                    *args,
+                    **kwargs,
+                )
+                return future.result()
+
+        setattr(thread_pool_wrapper, "__langsmith_traceable__", True)
+        sig = inspect.signature(thread_pool_wrapper)
         if not sig.parameters.get("config"):
             sig = sig.replace(
                 parameters=[
@@ -662,8 +703,8 @@ def traceable(
                     ),
                 ]
             )
-            selected_wrapper.__signature__ = sig  # type: ignore[attr-defined]
-        return selected_wrapper
+            thread_pool_wrapper.__signature__ = sig  # type: ignore[attr-defined]
+        return thread_pool_wrapper
 
     # If the decorator is called with no arguments, then it's being used as a
     # decorator, so we return the decorator function
